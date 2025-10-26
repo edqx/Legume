@@ -67,7 +67,7 @@ pub fn Server(comptime Handler: type) type {
 
                 var reader: std.Io.Reader = .fixed(message_slice);
                 self.readOption(receive.sender, &reader) catch |e| switch (e) {
-                    error.ReadFailed => break,
+                    error.ReadFailed => break, // todo: this is probably fatal, but research to make sure
                     error.EndOfStream => continue, // todo: log bad message
                     else => return e,
                 };
@@ -75,7 +75,13 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn readOption(self: *ServerT, sender_endpoint: network.EndPoint, reader: *std.Io.Reader) !void {
-            const option = try reader.takeEnum(SendOption, .little);
+            const option = reader.takeEnum(SendOption, .little) catch |e| switch (e) {
+                error.InvalidEnumTag => {
+                    std.log.err("Got an invalid send option from {f} - is this a Hazel connection?", .{});
+                    return;
+                },
+                else => return e,
+            };
 
             const result = safe_fetch: {
                 self.mutex.lock();
