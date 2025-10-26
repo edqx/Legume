@@ -1,0 +1,15 @@
+.{
+    .name = .testtest,
+    .version = "0.0.1",
+    .fingerprint = 0xec69bb313526b252,
+    .dependencies = .{
+        .hazel = .{
+            .path = "../hazel",
+        },
+    },
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+    },
+}

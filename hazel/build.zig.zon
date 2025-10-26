@@ -1,0 +1,16 @@
+.{
+    .name = .hazel,
+    .version = "0.0.1",
+    .fingerprint = 0xe91204e0c4dacea8,
+    .dependencies = .{
+        .network = .{
+            .url = "git+https://github.com/ikskuh/zig-network#7947237eec317d9458897f82089f343a05450c2b",
+            .hash = "network-0.1.0-Pm-Agl8xAQBmkwohveGOfTk4zQnuqDs0Ptfbms4KP5Ce",
+        },
+    },
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+    },
+}
