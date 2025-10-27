@@ -8,7 +8,7 @@ const Client = struct {
 const Handler = struct {
     pool: std.heap.MemoryPool(Client),
 
-    pub fn acceptConnection(self: *Handler, connection_info: hazel.server.Connection.Info, reader: *std.Io.Reader) !*hazel.server.Connection {
+    pub fn acceptConnection(self: *Handler, connection: hazel.server.Connection, reader: *std.Io.Reader) !*hazel.server.Connection {
         const client = try self.pool.create();
 
         var buffer: [4096]u8 = undefined;
@@ -21,7 +21,7 @@ const Handler = struct {
         std.log.info("bytes: {x}", .{remaining_bytes});
 
         client.* = .{
-            .connection = .init(connection_info),
+            .connection = connection,
         };
 
         return &client.connection;
