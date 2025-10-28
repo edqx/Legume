@@ -4,6 +4,7 @@ const network = @import("network");
 const log = std.log.scoped(.hazel_server);
 
 const max_out_of_order = 10;
+const ping_interval_seconds = 2;
 
 pub const SendOption = enum(u8) {
     unreliable = 0,
@@ -22,12 +23,26 @@ pub const OutOfOrderMessage = struct {
 
 pub const Connection = struct {
     endpoint: network.EndPoint,
-    expected_nonce: u16 = 0,
 
-    out_of_order_messages: [max_out_of_order]?OutOfOrderMessage,
+    // send data
+    send_mutex: std.Thread.Mutex = .{},
+    next_send_nonce: u16 = 0,
+    acknowledged_packets_bitfield: u8 = 0xff,
+
+    // receive data
+    expected_nonce: u16 = 0,
+    out_of_order_messages: [max_out_of_order]?OutOfOrderMessage = @splat(null),
 
     pub fn format(self: *Connection, writer: *std.Io.Writer) !void {
         try writer.print("{f}", .{self.endpoint});
+    }
+
+    pub fn takeSendNonce(self: *Connection) u16 {
+        return @atomicRmw(u16, &self.next_send_nonce, .Add, 1, .seq_cst);
+    }
+
+    pub fn expectNextNonce(self: *Connection) void {
+        self.expected_nonce +%= 1;
     }
 };
 
@@ -38,6 +53,7 @@ pub fn Server(comptime Handler: type) type {
         allocator: std.mem.Allocator,
 
         socket: network.Socket,
+        set: network.SocketSet,
         message_buffer: []u8,
 
         mutex: std.Thread.Mutex = .{},
@@ -45,17 +61,29 @@ pub fn Server(comptime Handler: type) type {
 
         handler: Handler,
 
+        maybe_ping_thread: ?std.Thread,
+        maybe_listen_thread: ?std.Thread,
+        closed_flag: std.atomic.Value(u32),
+
         pub fn init(allocator: std.mem.Allocator, message_buffer: []u8, handler: Handler) !ServerT {
             return .{
                 .allocator = allocator,
                 .socket = try .create(.ipv4, .udp),
+                .set = try .init(allocator),
                 .message_buffer = message_buffer,
                 .connections = .empty,
                 .handler = handler,
+                .maybe_ping_thread = null,
+                .maybe_listen_thread = null,
+                .closed_flag = .init(0),
             };
         }
 
         pub fn deinit(self: *ServerT) void {
+            self.closed_flag.store(1, .seq_cst);
+            if (self.maybe_ping_thread) |thread| thread.join();
+            if (self.maybe_listen_thread) |thread| thread.join();
+
             self.connections.deinit(self.allocator);
             self.socket.close();
         }
@@ -65,10 +93,31 @@ pub fn Server(comptime Handler: type) type {
             return self.incrementing_handle;
         }
 
-        pub fn listen(self: *ServerT, port: u16) !void {
+        pub fn bindStartPing(self: *ServerT, port: u16) !void {
             try self.socket.bind(.{ .address = try .parse("0.0.0.0"), .port = port });
+            try self.set.add(self.socket, .{ .read = true, .write = false });
 
+            self.maybe_ping_thread = try std.Thread.spawn(.{}, pingLoop, .{self});
+        }
+
+        pub fn listen(self: *ServerT, port: u16) !void {
+            try self.bindStartPing(port);
+            try self.listenLoop();
+        }
+
+        pub fn listenInAnotherThread(self: *ServerT, port: u16) !void {
+            try self.bindStartPing(port);
+            self.maybe_listen_thread = try std.Thread.spawn(.{}, listenLoop, .{self});
+        }
+
+        pub fn listenLoop(self: *ServerT) !void {
             while (true) {
+                const result = try network.waitForSocketEvent(&self.set, std.time.ns_per_ms * 500);
+                if (result == 0) { // no sockets with read ready
+                    if (self.closed_flag.raw == 1) break;
+                    continue;
+                }
+
                 const receive = try self.socket.receiveFrom(self.message_buffer);
                 const message_slice = self.message_buffer[0..receive.numberOfBytes];
 
@@ -78,6 +127,38 @@ pub fn Server(comptime Handler: type) type {
                     error.EndOfStream => continue, // todo: log bad message
                     else => return e,
                 };
+            }
+        }
+
+        pub fn pingLoop(self: *ServerT) !void {
+            main_loop: while (true) {
+                {
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+
+                    var connections_iter = self.connections.valueIterator();
+                    while (connections_iter.next()) |connection_ptr| {
+                        const connection = connection_ptr.*;
+
+                        connection.send_mutex.lock();
+                        defer connection.send_mutex.unlock();
+
+                        var buffer: [3]u8 = undefined;
+                        var writer: std.Io.Writer = .fixed(&buffer);
+
+                        try writer.writeByte(@intFromEnum(SendOption.ping));
+                        try writer.writeInt(u16, connection.takeSendNonce(), .big);
+
+                        try self.sendReliable(connection, &buffer);
+                    }
+                }
+
+                while (self.closed_flag.raw == 0) {
+                    std.Thread.Futex.timedWait(&self.closed_flag, 0, std.time.ns_per_s * ping_interval_seconds) catch |e| switch (e) {
+                        error.Timeout => continue :main_loop,
+                    };
+                }
+                break;
             }
         }
 
@@ -97,20 +178,32 @@ pub fn Server(comptime Handler: type) type {
             };
 
             if (result.found_existing) {
-                const sender = result.value_ptr.*;
+                const connection = result.value_ptr.*;
 
                 switch (send_option) {
                     .unreliable => {
-                        try self.processNormal(sender, false, reader);
+                        try self.processNormal(connection, false, reader);
                     },
                     .reliable, .hello, .ping => {
-                        try self.acknowledgeAndProcessReliable(sender, send_option, reader);
+                        try self.acknowledgeAndProcessReliable(connection, send_option, reader);
                     },
                     .disconnect => {
-                        log.info("Disconnect from connection {f}", .{sender});
+                        log.info("Disconnect from connection {f}", .{connection});
                     },
                     .acknowledge => {
-                        //
+                        connection.send_mutex.lock();
+                        defer connection.send_mutex.unlock();
+
+                        const nonce = try reader.takeInt(u16, .big);
+                        if (nonce >= connection.next_send_nonce) return;
+                        const packet_idx = connection.next_send_nonce - 1 - nonce;
+
+                        if (packet_idx > @bitSizeOf(u8)) {
+                            std.log.warn("Got old acknowledgement for nonce {}. We don't care", .{nonce});
+                            return;
+                        }
+
+                        connection.acknowledged_packets_bitfield |= (@as(u8, 1) << @intCast(packet_idx));
                     },
                 }
             } else {
@@ -125,7 +218,6 @@ pub fn Server(comptime Handler: type) type {
                 const sender_connection: Connection = .{
                     .endpoint = sender_endpoint,
                     .expected_nonce = nonce +% 1,
-                    .out_of_order_messages = @splat(null),
                 };
 
                 result.value_ptr.* = try self.handler.acceptConnection(sender_connection, reader);
@@ -154,7 +246,7 @@ pub fn Server(comptime Handler: type) type {
                     return;
                 }
 
-                connection.expected_nonce = nonce +% 1;
+                connection.expectNextNonce();
             }
 
             try self.acknowledgeReliable(connection, nonce);
@@ -246,7 +338,7 @@ pub fn Server(comptime Handler: type) type {
                     try self.processNormal(connection, true, reader);
                 },
                 .hello => {
-                    log.warn("Got duplicate hello from connection {f}", .{connection});
+                    log.err("Got duplicate hello from connection {f}", .{connection});
                 },
                 .unreliable, .acknowledge, .disconnect => unreachable,
             }
@@ -258,17 +350,22 @@ pub fn Server(comptime Handler: type) type {
 
             try writer.writeByte(@intFromEnum(SendOption.acknowledge));
             try writer.writeInt(u16, nonce, .big);
-            try writer.writeByte(0xff); // TODO: replace with un-acknowledged packets from client
+            try writer.writeByte(connection.acknowledged_packets_bitfield);
 
             _ = try self.socket.sendTo(connection.endpoint, &buffer);
         }
 
         pub fn processNormal(self: *ServerT, connection: *Connection, reliable: bool, reader: *std.Io.Reader) !void {
-            log.info("Got normal message", .{});
-            _ = self;
-            _ = connection;
-            _ = reliable;
-            _ = reader;
+            try self.handler.readNormal(connection, reliable, reader);
+        }
+
+        pub fn sendRaw(self: *ServerT, connection: *Connection, buffer: []u8) !void {
+            _ = try self.socket.sendTo(connection.endpoint, buffer);
+        }
+
+        pub fn sendReliable(self: *ServerT, connection: *Connection, buffer: []u8) !void {
+            connection.acknowledged_packets_bitfield <<= 1;
+            _ = try self.socket.sendTo(connection.endpoint, buffer);
         }
     };
 }

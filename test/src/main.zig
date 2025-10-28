@@ -26,6 +26,13 @@ const Handler = struct {
 
         return &client.connection;
     }
+
+    pub fn readNormal(self: *Handler, connection: *hazel.server.Connection, is_reliable: bool, reader: *std.Io.Reader) !void {
+        _ = self;
+        _ = connection;
+        _ = is_reliable;
+        _ = reader;
+    }
 };
 
 pub fn main() !void {
@@ -38,6 +45,9 @@ pub fn main() !void {
 
     var message_buffer: [4096]u8 = undefined;
     var server: hazel.Server(*Handler) = try .init(allocator, &message_buffer, &handler);
+    defer server.deinit();
 
-    try server.listen(22023);
+    try server.listenInAnotherThread(22023);
+
+    std.Thread.sleep(30 * std.time.ns_per_s);
 }
