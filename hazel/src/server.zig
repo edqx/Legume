@@ -150,6 +150,8 @@ pub fn Server(comptime Handler: type) type {
                         connection.send_mutex.lock();
                         defer connection.send_mutex.unlock();
 
+                        // TODO: resend unacknowledged buffers
+
                         var pooled_buffer = try self.takeBuffer();
                         var writer: std.Io.Writer = .fixed(pooled_buffer.buffer);
 
