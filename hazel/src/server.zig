@@ -6,6 +6,8 @@ const log = std.log.scoped(.hazel_server);
 const max_out_of_order = 10;
 const ping_interval_seconds = 2;
 
+const max_send_size = 4096;
+
 pub const SendOption = enum(u8) {
     unreliable = 0,
     reliable = 1,
@@ -24,7 +26,7 @@ pub const OutOfOrderMessage = struct {
 pub const PooledBufferNode = struct {
     node: std.DoublyLinkedList.Node,
     buffer: []u8,
-    written_length: usize,
+    writer: std.Io.Writer,
 };
 
 pub const Connection = struct {
@@ -61,12 +63,14 @@ pub fn Server(comptime Handler: type) type {
 
         socket: network.Socket,
         set: network.SocketSet,
-        message_buffer: []u8,
 
         mutex: std.Thread.Mutex = .{},
         connections: std.AutoHashMapUnmanaged(network.EndPoint, *Connection),
 
+        message_buffer: []u8,
         handler: Handler,
+
+        send_buffer_pool: std.DoublyLinkedList = .{},
 
         maybe_ping_thread: ?std.Thread,
         maybe_listen_thread: ?std.Thread,
@@ -153,10 +157,9 @@ pub fn Server(comptime Handler: type) type {
                         // TODO: resend unacknowledged buffers
 
                         var pooled_buffer = try self.takeBuffer();
-                        var writer: std.Io.Writer = .fixed(pooled_buffer.buffer);
 
-                        try writer.writeByte(@intFromEnum(SendOption.ping));
-                        try writer.writeInt(u16, connection.takeSendNonce(), .big);
+                        try pooled_buffer.writer.writeByte(@intFromEnum(SendOption.ping));
+                        try pooled_buffer.writer.writeInt(u16, connection.takeSendNonce(), .big);
 
                         try self.sendReliable(connection, pooled_buffer);
                     }
@@ -214,7 +217,7 @@ pub fn Server(comptime Handler: type) type {
 
                         const bit = @as(u8, 1) << @intCast(packet_idx);
 
-                        if ((connection.acknowledged_packets_bitfield & bit) != 0) {
+                        if ((connection.acknowledged_packets_bitfield & bit) != 0) { // already acknowledged
                             return;
                         }
 
@@ -223,7 +226,7 @@ pub fn Server(comptime Handler: type) type {
                         var ll_node = connection.unacknowledged_packet_buffers.first.?;
                         for (0..packet_idx) |newer_packet_idx| {
                             const bit2 = @as(u8, 1) << @intCast(newer_packet_idx);
-                            if ((connection.acknowledged_packets_bitfield & bit2) != 0) {
+                            if ((connection.acknowledged_packets_bitfield & bit2) == 0) {
                                 ll_node = ll_node.next.?;
                             }
                         }
@@ -389,20 +392,24 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn takeBuffer(self: *ServerT) !*PooledBufferNode {
+            if (self.send_buffer_pool.popFirst()) |node| {
+                return @fieldParentPtr("node", node);
+            }
+
             const buffer = try self.allocator.alloc(u8, 4096);
 
             const pooled = try self.allocator.create(PooledBufferNode);
             pooled.* = .{
                 .buffer = buffer,
                 .node = .{},
-                .written_length = 0,
+                .writer = .fixed(buffer),
             };
             return pooled;
         }
 
         pub fn returnToBufferPool(self: *ServerT, pooled_buffer: *PooledBufferNode) void {
-            self.allocator.free(pooled_buffer.buffer);
-            self.allocator.destroy(pooled_buffer);
+            pooled_buffer.writer = .fixed(pooled_buffer.buffer);
+            self.send_buffer_pool.prepend(&pooled_buffer.node);
         }
 
         pub fn sendRaw(self: *ServerT, connection: *Connection, buffer: []u8) !void {
@@ -411,8 +418,11 @@ pub fn Server(comptime Handler: type) type {
 
         pub fn sendReliable(self: *ServerT, connection: *Connection, pooled_buffer: *PooledBufferNode) !void {
             const last_unacknowledged = (connection.acknowledged_packets_bitfield & 0x80) == 0;
+
+            // add this packet to be the most recent unacknowledged packet
             connection.acknowledged_packets_bitfield <<= 1;
             connection.unacknowledged_packet_buffers.prepend(&pooled_buffer.node);
+
             // If the 8th last packet was unacknowledged, it has an entry in the un-ack'd packet buffers
             // linked list that we need to remove, since it's no longer relevant.
             if (last_unacknowledged) {
@@ -420,7 +430,8 @@ pub fn Server(comptime Handler: type) type {
                 const last_pooled_buffer: *PooledBufferNode = @fieldParentPtr("node", ll_node);
                 self.returnToBufferPool(last_pooled_buffer);
             }
-            try self.sendRaw(connection, pooled_buffer.buffer);
+
+            try self.sendRaw(connection, pooled_buffer.writer.buffered());
         }
     };
 }
