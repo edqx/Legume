@@ -14,18 +14,20 @@ pub const SendOption = enum(u8) {
 
 // We're relying on the fact that we only ever use writers/readers into fixed buffers
 // in our hazel implementation.
-pub const Message = struct {
-    tag: u8,
-    limited_reader: std.Io.Reader.Limited,
+pub fn Message(comptime TagType: type) type {
+    return struct {
+        tag: TagType,
+        limited_reader: std.Io.Reader.Limited,
 
-    pub fn discardRemaining(self: *Message) !void {
-        _ = try self.limited_reader.unlimited.discard(self.limited_reader.remaining);
-    }
-};
+        pub fn discardRemaining(self: *@This()) !void {
+            _ = try self.limited_reader.unlimited.discard(self.limited_reader.remaining);
+        }
+    };
+}
 
-pub fn takeMessage(reader: *std.Io.Reader) !Message {
+pub fn takeMessage(TagType: type, reader: *std.Io.Reader) !Message(TagType) {
     const length = try reader.takeInt(u16, .little);
-    const tag = try reader.takeInt(u8, .little);
+    const tag = try reader.takeEnum(TagType, .little);
 
     return .{
         .tag = tag,

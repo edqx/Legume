@@ -6,9 +6,33 @@ const RoomCode = @import("./room_code.zig").RoomCode;
 
 const log = std.log.scoped(.legume);
 
-const Client = struct {
+pub const Client = struct {
     client_version: ClientVersion,
     connection: hazel.server.Connection,
+};
+
+pub const RootMessageTag = enum(u8) {
+    host_game,
+    join_game,
+    start_game,
+    remove_game,
+    remove_player,
+    game_data,
+    game_data_to,
+    joined_game,
+    end_game,
+    get_game_list_v1,
+    alter_game,
+    kick_player,
+    wait_for_host,
+    redirect,
+    master_server_list,
+    get_game_list_v2 = 16,
+    report_player,
+    set_game_session = 20,
+    set_active_pod_type,
+    query_platform_ids,
+    query_lobby_info,
 };
 
 const Handler = struct {
@@ -34,10 +58,10 @@ const Handler = struct {
 
     pub fn readNormal(self: *Handler, connection: *hazel.server.Connection, is_reliable: bool, reader: *std.Io.Reader) !void {
         while (reader.bufferedLen() > 0) {
-            var message = try hazel.takeMessage(reader);
+            var message = try hazel.takeMessage(RootMessageTag, reader);
 
             switch (message.tag) {
-                0 => {
+                .host_game => {
                     const room_code: RoomCode = try .fromSlice("REDSUS");
 
                     connection.send_mutex.lock();
@@ -51,7 +75,7 @@ const Handler = struct {
 
                     try self.server.sendExpectAck(connection, pooled_buffer);
                 },
-                1 => {
+                .join_game => {
                     const room_id = try reader.takeInt(i32, .little);
                     const room_code: RoomCode = .fromInt(room_id);
 
