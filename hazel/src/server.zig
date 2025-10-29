@@ -154,6 +154,15 @@ pub fn Server(comptime Handler: type) type {
                         connection.send_mutex.lock();
                         defer connection.send_mutex.unlock();
 
+                        var unacknowledged_packet_ll_node = connection.unacknowledged_packet_buffers.first;
+                        for (0..@bitSizeOf(u8)) |i| {
+                            if ((connection.acknowledged_packets_bitfield & (@as(u8, 1) << @intCast(i))) == 0) {
+                                const pooled_buffer: *PooledBufferNode = @fieldParentPtr("node", unacknowledged_packet_ll_node.?);
+                                try self.sendRaw(connection, pooled_buffer.writer.buffered());
+                                unacknowledged_packet_ll_node = unacknowledged_packet_ll_node.?.next;
+                            }
+                        }
+
                         // TODO: resend unacknowledged buffers
 
                         var pooled_buffer = try self.takeBuffer();
@@ -413,6 +422,7 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn sendRaw(self: *ServerT, connection: *Connection, buffer: []u8) !void {
+            log.info("Sent {x}", .{buffer});
             _ = try self.socket.sendTo(connection.endpoint, buffer);
         }
 
