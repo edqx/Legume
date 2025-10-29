@@ -184,7 +184,7 @@ pub fn Server(comptime Handler: type) type {
         pub fn readOption(self: *ServerT, sender_endpoint: network.EndPoint, reader: *std.Io.Reader) !void {
             const send_option = reader.takeEnum(SendOption, .little) catch |e| switch (e) {
                 error.InvalidEnumTag => {
-                    std.log.err("Got an invalid send option from {f} - is this a Hazel connection?", .{sender_endpoint});
+                    log.err("Got an invalid send option from {f} - is this a Hazel connection?", .{sender_endpoint});
                     return;
                 },
                 else => return e,
@@ -267,7 +267,7 @@ pub fn Server(comptime Handler: type) type {
             const defeats_buffer = buffer_idx >= max_out_of_order;
 
             if (defeats_buffer) {
-                std.log.err("Connection {[sender]f} has sent a {[option]} wholly out-of-order message: got {[nonce]}, expected {[expected_nonce]}", .{
+                log.err("Connection {[sender]f} has sent a {[option]} wholly out-of-order message: got {[nonce]}, expected {[expected_nonce]}", .{
                     .sender = connection,
                     .option = send_option,
                     .nonce = nonce,
@@ -372,7 +372,7 @@ pub fn Server(comptime Handler: type) type {
             const packet_idx = connection.next_send_nonce - 1 - nonce;
 
             if (packet_idx > @bitSizeOf(u8)) {
-                std.log.warn("Got old acknowledgement for nonce {}. We don't care", .{nonce});
+                log.warn("Got old acknowledgement for nonce {}. We don't care", .{nonce});
                 return;
             }
 

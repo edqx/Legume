@@ -4,6 +4,8 @@ const hazel = @import("hazel");
 const ClientVersion = @import("./ClientVersion.zig");
 const RoomCode = @import("./room_code.zig").RoomCode;
 
+const log = std.log.scoped(.legume);
+
 const Client = struct {
     client_version: ClientVersion,
     connection: hazel.server.Connection,
@@ -20,7 +22,7 @@ const Handler = struct {
 
         const client_version: ClientVersion = .parseFromInt(try reader.takeInt(u32, .little));
 
-        std.log.info("Client connected, version: {f}", .{client_version});
+        log.info("Client connected, version: {f}", .{client_version});
 
         client.* = .{
             .client_version = client_version,
@@ -53,7 +55,7 @@ const Handler = struct {
                     const room_id = try reader.takeInt(i32, .little);
                     const room_code: RoomCode = .fromInt(room_id);
 
-                    std.log.info("Client trying to join room {f}", .{room_code});
+                    log.info("Client trying to join room {f}", .{room_code});
                 },
                 else => {},
             }
