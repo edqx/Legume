@@ -35,7 +35,7 @@ pub const Connection = struct {
     // send data
     send_mutex: std.Thread.Mutex = .{},
     next_send_nonce: u16 = 0,
-    acknowledged_packets_bitfield: u8 = 0xff,
+    acknowledged_packets_bitfield: u8 = 0b11111111,
     unacknowledged_packet_buffers: std.DoublyLinkedList = .{}, // these correlate to the 0 bits in the above bitfield
 
     // receive data
@@ -143,6 +143,8 @@ pub fn Server(comptime Handler: type) type {
 
         pub fn pingLoop(self: *ServerT) !void {
             main_loop: while (true) {
+                var connections_to_disconnect: std.ArrayListUnmanaged(*Connection) = .empty;
+
                 {
                     self.mutex.lock();
                     defer self.mutex.unlock();
@@ -154,6 +156,11 @@ pub fn Server(comptime Handler: type) type {
                         connection.send_mutex.lock();
                         defer connection.send_mutex.unlock();
 
+                        if (connection.acknowledged_packets_bitfield == 0x00) {
+                            try connections_to_disconnect.append(self.allocator, connection);
+                            continue;
+                        }
+
                         var unacknowledged_packet_ll_node = connection.unacknowledged_packet_buffers.first;
                         for (0..@bitSizeOf(u8)) |i| {
                             if ((connection.acknowledged_packets_bitfield & (@as(u8, 1) << @intCast(i))) == 0) {
@@ -163,15 +170,17 @@ pub fn Server(comptime Handler: type) type {
                             }
                         }
 
-                        // TODO: resend unacknowledged buffers
-
-                        var pooled_buffer = try self.takeBuffer();
+                        var pooled_buffer = try self.takeBufferFromPool();
 
                         try pooled_buffer.writer.writeByte(@intFromEnum(SendOption.ping));
                         try pooled_buffer.writer.writeInt(u16, connection.takeSendNonce(), .big);
 
                         try self.sendReliable(connection, pooled_buffer);
                     }
+                }
+
+                for (connections_to_disconnect.items) |connection| {
+                    try self.disconnectConnection(connection);
                 }
 
                 while (self.closed_flag.raw == 0) {
@@ -209,7 +218,7 @@ pub fn Server(comptime Handler: type) type {
                         try self.acknowledgeAndProcessReliable(connection, send_option, reader);
                     },
                     .disconnect => {
-                        log.info("Disconnect from connection {f}", .{connection});
+                        try self.disconnectConnection(connection);
                     },
                     .acknowledge => {
                         connection.send_mutex.lock();
@@ -244,7 +253,7 @@ pub fn Server(comptime Handler: type) type {
                         connection.unacknowledged_packet_buffers.remove(ll_node);
                         connection.acknowledged_packets_bitfield |= bit;
 
-                        self.returnToBufferPool(pooled_buffer);
+                        self.returnBufferToPool(pooled_buffer);
                     },
                 }
             } else {
@@ -386,21 +395,20 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn acknowledgeReliable(self: *ServerT, connection: *Connection, nonce: u16) !void {
-            var buffer: [4]u8 = undefined;
-            var writer: std.Io.Writer = .fixed(&buffer);
+            var pooled_buffer = try self.takeBufferFromPool();
 
-            try writer.writeByte(@intFromEnum(SendOption.acknowledge));
-            try writer.writeInt(u16, nonce, .big);
-            try writer.writeByte(connection.acknowledged_packets_bitfield);
+            try pooled_buffer.writer.writeByte(@intFromEnum(SendOption.acknowledge));
+            try pooled_buffer.writer.writeInt(u16, nonce, .big);
+            try pooled_buffer.writer.writeByte(connection.acknowledged_packets_bitfield);
 
-            _ = try self.socket.sendTo(connection.endpoint, &buffer);
+            _ = try self.sendUnreliable(connection, pooled_buffer);
         }
 
         pub fn processNormal(self: *ServerT, connection: *Connection, reliable: bool, reader: *std.Io.Reader) !void {
             try self.handler.readNormal(connection, reliable, reader);
         }
 
-        pub fn takeBuffer(self: *ServerT) !*PooledBufferNode {
+        pub fn takeBufferFromPool(self: *ServerT) !*PooledBufferNode {
             if (self.send_buffer_pool.popFirst()) |node| {
                 return @fieldParentPtr("node", node);
             }
@@ -416,14 +424,18 @@ pub fn Server(comptime Handler: type) type {
             return pooled;
         }
 
-        pub fn returnToBufferPool(self: *ServerT, pooled_buffer: *PooledBufferNode) void {
+        pub fn returnBufferToPool(self: *ServerT, pooled_buffer: *PooledBufferNode) void {
             pooled_buffer.writer = .fixed(pooled_buffer.buffer);
             self.send_buffer_pool.prepend(&pooled_buffer.node);
         }
 
         pub fn sendRaw(self: *ServerT, connection: *Connection, buffer: []u8) !void {
-            log.info("Sent {x}", .{buffer});
             _ = try self.socket.sendTo(connection.endpoint, buffer);
+        }
+
+        pub fn sendUnreliable(self: *ServerT, connection: *Connection, pooled_buffer: *PooledBufferNode) !void {
+            try self.sendRaw(connection, pooled_buffer.writer.buffered());
+            self.returnBufferToPool(pooled_buffer);
         }
 
         pub fn sendReliable(self: *ServerT, connection: *Connection, pooled_buffer: *PooledBufferNode) !void {
@@ -438,10 +450,36 @@ pub fn Server(comptime Handler: type) type {
             if (last_unacknowledged) {
                 const ll_node = connection.unacknowledged_packet_buffers.pop().?;
                 const last_pooled_buffer: *PooledBufferNode = @fieldParentPtr("node", ll_node);
-                self.returnToBufferPool(last_pooled_buffer);
+                self.returnBufferToPool(last_pooled_buffer);
             }
 
             try self.sendRaw(connection, pooled_buffer.writer.buffered());
+        }
+
+        // TODO: disconnect reasons
+        pub fn disconnectConnection(self: *ServerT, connection: *Connection) !void {
+            {
+                // Use the mutex in a new scope, because self.handler.disconnectConnection
+                // will likely leave the memory undefined before defer unlock() can be run
+                connection.send_mutex.lock();
+                defer connection.send_mutex.unlock();
+
+                var pooled_buffer = try self.takeBufferFromPool();
+                try pooled_buffer.writer.writeByte(@intFromEnum(SendOption.disconnect));
+                _ = try self.sendUnreliable(connection, pooled_buffer);
+
+                var maybe_buffer_ll_node = connection.unacknowledged_packet_buffers.first;
+                while (maybe_buffer_ll_node) |buffer_ll_node| {
+                    maybe_buffer_ll_node = buffer_ll_node.next;
+
+                    const unacked_pooled_buffer: *PooledBufferNode = @fieldParentPtr("node", buffer_ll_node);
+                    connection.unacknowledged_packet_buffers.remove(buffer_ll_node);
+                    self.returnBufferToPool(unacked_pooled_buffer);
+                }
+
+                _ = self.connections.remove(connection.endpoint);
+            }
+            try self.handler.disconnectConnection(connection);
         }
     };
 }

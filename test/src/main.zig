@@ -33,6 +33,11 @@ const Handler = struct {
         _ = is_reliable;
         _ = reader;
     }
+
+    pub fn disconnectConnection(self: *Handler, connection: *hazel.server.Connection) !void {
+        const client: *Client = @fieldParentPtr("connection", connection);
+        self.pool.destroy(client);
+    }
 };
 
 pub fn main() !void {
