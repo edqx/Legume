@@ -1,10 +1,10 @@
 .{
-    .name = .testtest,
+    .name = .legume,
     .version = "0.0.1",
-    .fingerprint = 0xec69bb313526b252,
+    .fingerprint = 0x86667383c2baf79d,
     .dependencies = .{
         .hazel = .{
-            .path = "../hazel",
+            .path = "./hazel",
         },
     },
     .paths = .{

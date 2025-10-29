@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) !void {
 
     const hazel = b.dependency("hazel", .{});
 
-    const testtest = b.addModule("hazel", .{
+    const legume_module = b.addModule("hazel", .{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -15,10 +15,10 @@ pub fn build(b: *std.Build) !void {
         },
     });
 
-    const testtestexe = b.addExecutable(.{
-        .name = "testtest",
-        .root_module = testtest,
+    const legume_executable = b.addExecutable(.{
+        .name = "Legume",
+        .root_module = legume_module,
     });
 
-    b.installArtifact(testtestexe);
+    b.installArtifact(legume_executable);
 }

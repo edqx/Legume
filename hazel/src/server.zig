@@ -1,21 +1,14 @@
 const std = @import("std");
 const network = @import("network");
 
+const SendOption = @import("./root.zig").SendOption;
+
 const log = std.log.scoped(.hazel_server);
 
 const max_out_of_order = 10;
 const ping_interval_seconds = 2;
 
 const max_send_size = 4096;
-
-pub const SendOption = enum(u8) {
-    unreliable = 0,
-    reliable = 1,
-    hello = 8,
-    disconnect = 9,
-    acknowledge = 10,
-    ping = 12,
-};
 
 pub const OutOfOrderMessage = struct {
     send_option: SendOption,
@@ -170,12 +163,8 @@ pub fn Server(comptime Handler: type) type {
                             }
                         }
 
-                        var pooled_buffer = try self.takeBufferFromPool();
-
-                        try pooled_buffer.writer.writeByte(@intFromEnum(SendOption.ping));
-                        try pooled_buffer.writer.writeInt(u16, connection.takeSendNonce(), .big);
-
-                        try self.sendReliable(connection, pooled_buffer);
+                        const pooled_buffer = try self.takeBufferAsOption(connection, .ping);
+                        try self.sendExpectAck(connection, pooled_buffer);
                     }
                 }
 
@@ -221,39 +210,7 @@ pub fn Server(comptime Handler: type) type {
                         try self.disconnectConnection(connection);
                     },
                     .acknowledge => {
-                        connection.send_mutex.lock();
-                        defer connection.send_mutex.unlock();
-
-                        const nonce = try reader.takeInt(u16, .big);
-                        if (nonce >= connection.next_send_nonce) return;
-                        const packet_idx = connection.next_send_nonce - 1 - nonce;
-
-                        if (packet_idx > @bitSizeOf(u8)) {
-                            std.log.warn("Got old acknowledgement for nonce {}. We don't care", .{nonce});
-                            return;
-                        }
-
-                        const bit = @as(u8, 1) << @intCast(packet_idx);
-
-                        if ((connection.acknowledged_packets_bitfield & bit) != 0) { // already acknowledged
-                            return;
-                        }
-
-                        // We need to find the unack'd packet buffer that this previously unack'd
-                        // nonce is for
-                        var ll_node = connection.unacknowledged_packet_buffers.first.?;
-                        for (0..packet_idx) |newer_packet_idx| {
-                            const bit2 = @as(u8, 1) << @intCast(newer_packet_idx);
-                            if ((connection.acknowledged_packets_bitfield & bit2) == 0) {
-                                ll_node = ll_node.next.?;
-                            }
-                        }
-
-                        const pooled_buffer: *PooledBufferNode = @fieldParentPtr("node", ll_node);
-                        connection.unacknowledged_packet_buffers.remove(ll_node);
-                        connection.acknowledged_packets_bitfield |= bit;
-
-                        self.returnBufferToPool(pooled_buffer);
+                        try self.processAcknowledgement(connection, reader);
                     },
                 }
             } else {
@@ -395,17 +352,51 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn acknowledgeReliable(self: *ServerT, connection: *Connection, nonce: u16) !void {
-            var pooled_buffer = try self.takeBufferFromPool();
-
-            try pooled_buffer.writer.writeByte(@intFromEnum(SendOption.acknowledge));
+            var pooled_buffer = try self.takeBufferAsOption(connection, .acknowledge);
             try pooled_buffer.writer.writeInt(u16, nonce, .big);
             try pooled_buffer.writer.writeByte(connection.acknowledged_packets_bitfield);
 
-            _ = try self.sendUnreliable(connection, pooled_buffer);
+            _ = try self.sendNoAck(connection, pooled_buffer);
         }
 
         pub fn processNormal(self: *ServerT, connection: *Connection, reliable: bool, reader: *std.Io.Reader) !void {
             try self.handler.readNormal(connection, reliable, reader);
+        }
+
+        pub fn processAcknowledgement(self: *ServerT, connection: *Connection, reader: *std.Io.Reader) !void {
+            connection.send_mutex.lock();
+            defer connection.send_mutex.unlock();
+
+            const nonce = try reader.takeInt(u16, .big);
+            if (nonce >= connection.next_send_nonce) return;
+            const packet_idx = connection.next_send_nonce - 1 - nonce;
+
+            if (packet_idx > @bitSizeOf(u8)) {
+                std.log.warn("Got old acknowledgement for nonce {}. We don't care", .{nonce});
+                return;
+            }
+
+            const bit = @as(u8, 1) << @intCast(packet_idx);
+
+            if ((connection.acknowledged_packets_bitfield & bit) != 0) { // already acknowledged
+                return;
+            }
+
+            // We need to find the unack'd packet buffer that this previously unack'd
+            // nonce is for
+            var ll_node = connection.unacknowledged_packet_buffers.first.?;
+            for (0..packet_idx) |newer_packet_idx| {
+                const bit2 = @as(u8, 1) << @intCast(newer_packet_idx);
+                if ((connection.acknowledged_packets_bitfield & bit2) == 0) {
+                    ll_node = ll_node.next.?;
+                }
+            }
+
+            const pooled_buffer: *PooledBufferNode = @fieldParentPtr("node", ll_node);
+            connection.unacknowledged_packet_buffers.remove(ll_node);
+            connection.acknowledged_packets_bitfield |= bit;
+
+            self.returnBufferToPool(pooled_buffer);
         }
 
         pub fn takeBufferFromPool(self: *ServerT) !*PooledBufferNode {
@@ -429,16 +420,28 @@ pub fn Server(comptime Handler: type) type {
             self.send_buffer_pool.prepend(&pooled_buffer.node);
         }
 
+        pub fn takeBufferAsOption(self: *ServerT, connection: *Connection, send_option: SendOption) !*PooledBufferNode {
+            const pooled_buffer = try self.takeBufferFromPool();
+            try pooled_buffer.writer.writeInt(u8, @intFromEnum(send_option), .little);
+            switch (send_option) {
+                .reliable, .hello, .ping => {
+                    try pooled_buffer.writer.writeInt(u16, connection.takeSendNonce(), .big);
+                },
+                .unreliable, .disconnect, .acknowledge => {},
+            }
+            return pooled_buffer;
+        }
+
         pub fn sendRaw(self: *ServerT, connection: *Connection, buffer: []u8) !void {
             _ = try self.socket.sendTo(connection.endpoint, buffer);
         }
 
-        pub fn sendUnreliable(self: *ServerT, connection: *Connection, pooled_buffer: *PooledBufferNode) !void {
+        pub fn sendNoAck(self: *ServerT, connection: *Connection, pooled_buffer: *PooledBufferNode) !void {
             try self.sendRaw(connection, pooled_buffer.writer.buffered());
             self.returnBufferToPool(pooled_buffer);
         }
 
-        pub fn sendReliable(self: *ServerT, connection: *Connection, pooled_buffer: *PooledBufferNode) !void {
+        pub fn sendExpectAck(self: *ServerT, connection: *Connection, pooled_buffer: *PooledBufferNode) !void {
             const last_unacknowledged = (connection.acknowledged_packets_bitfield & 0x80) == 0;
 
             // add this packet to be the most recent unacknowledged packet
@@ -464,9 +467,8 @@ pub fn Server(comptime Handler: type) type {
                 connection.send_mutex.lock();
                 defer connection.send_mutex.unlock();
 
-                var pooled_buffer = try self.takeBufferFromPool();
-                try pooled_buffer.writer.writeByte(@intFromEnum(SendOption.disconnect));
-                _ = try self.sendUnreliable(connection, pooled_buffer);
+                const pooled_buffer = try self.takeBufferAsOption(connection, .disconnect);
+                _ = try self.sendNoAck(connection, pooled_buffer);
 
                 var maybe_buffer_ll_node = connection.unacknowledged_packet_buffers.first;
                 while (maybe_buffer_ll_node) |buffer_ll_node| {
