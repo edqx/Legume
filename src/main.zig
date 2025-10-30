@@ -4,6 +4,8 @@ const hazel = @import("hazel");
 const ClientVersion = @import("./ClientVersion.zig");
 const RoomCode = @import("./room_code.zig").RoomCode;
 
+const Room = @import("./Room.zig");
+
 const log = std.log.scoped(.legume);
 
 pub const Client = struct {
@@ -98,6 +100,10 @@ const Handler = struct {
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
+
+    var room: Room = undefined;
+
+    try room.initSpawn();
 
     var handler: Handler = .{
         .server = undefined,

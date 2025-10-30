@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const win32 = b.dependency("win32", .{});
     const hazel = b.dependency("hazel", .{});
 
     const legume_module = b.addModule("hazel", .{
@@ -12,7 +13,9 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hazel", .module = hazel.module("hazel") },
+            .{ .name = "win32", .module = win32.module("win32") },
         },
+        // .link_libc = true,
     });
 
     const legume_executable = b.addExecutable(.{
