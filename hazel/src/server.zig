@@ -61,7 +61,6 @@ pub fn Server(comptime Handler: type) type {
         connections: std.AutoHashMapUnmanaged(network.EndPoint, *Connection),
 
         message_buffer: []u8,
-        handler: Handler,
 
         send_buffer_pool: std.DoublyLinkedList = .{},
 
@@ -69,14 +68,13 @@ pub fn Server(comptime Handler: type) type {
         maybe_listen_thread: ?std.Thread,
         closed_flag: std.atomic.Value(u32),
 
-        pub fn init(allocator: std.mem.Allocator, message_buffer: []u8, handler: Handler) !ServerT {
-            return .{
+        pub fn init(self: *ServerT, allocator: std.mem.Allocator, message_buffer: []u8) !void {
+            self.* = .{
                 .allocator = allocator,
                 .socket = try .create(.ipv4, .udp),
                 .set = try .init(allocator),
                 .message_buffer = message_buffer,
                 .connections = .empty,
-                .handler = handler,
                 .maybe_ping_thread = null,
                 .maybe_listen_thread = null,
                 .closed_flag = .init(0),
@@ -88,7 +86,15 @@ pub fn Server(comptime Handler: type) type {
             if (self.maybe_ping_thread) |thread| thread.join();
             if (self.maybe_listen_thread) |thread| thread.join();
 
+            var maybe_node = self.send_buffer_pool.first;
+            while (maybe_node) |node| {
+                const pooled_buffer: *PooledBufferNode = @fieldParentPtr("node", node);
+                self.allocator.free(pooled_buffer.buffer);
+                maybe_node = node.next;
+            }
+
             self.connections.deinit(self.allocator);
+            self.set.deinit();
             self.socket.close();
         }
 
@@ -227,7 +233,7 @@ pub fn Server(comptime Handler: type) type {
                     .expected_nonce = nonce +% 1,
                 };
 
-                result.value_ptr.* = try self.handler.acceptConnection(sender_connection, reader);
+                result.value_ptr.* = try Handler.acceptConnection(self, sender_connection, reader);
                 try self.acknowledgeReliable(result.value_ptr.*, nonce);
             }
         }
@@ -360,7 +366,7 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn processNormal(self: *ServerT, connection: *Connection, reliable: bool, reader: *std.Io.Reader) !void {
-            try self.handler.readNormal(connection, reliable, reader);
+            try Handler.readNormal(self, connection, reliable, reader);
         }
 
         pub fn processAcknowledgement(self: *ServerT, connection: *Connection, reader: *std.Io.Reader) !void {
@@ -462,7 +468,7 @@ pub fn Server(comptime Handler: type) type {
         // TODO: disconnect reasons
         pub fn disconnectConnection(self: *ServerT, connection: *Connection) !void {
             {
-                // Use the mutex in a new scope, because self.handler.disconnectConnection
+                // Use the mutex in a new scope, because Handler.disconnectConnection
                 // will likely leave the memory undefined before defer unlock() can be run
                 connection.send_mutex.lock();
                 defer connection.send_mutex.unlock();
@@ -481,7 +487,7 @@ pub fn Server(comptime Handler: type) type {
 
                 _ = self.connections.remove(connection.endpoint);
             }
-            try self.handler.disconnectConnection(connection);
+            try Handler.disconnectConnection(self, connection);
         }
     };
 }

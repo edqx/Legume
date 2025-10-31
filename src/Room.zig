@@ -7,6 +7,7 @@ const Room = @This();
 const log = std.log.scoped(.legume_room);
 
 fixed_update_thread: std.Thread,
+message_queue_thread: std.Thread,
 delta_seconds: f64,
 
 pub fn initSpawn(self: *Room) !void {
@@ -15,7 +16,7 @@ pub fn initSpawn(self: *Room) !void {
 }
 
 pub fn fixedUpdateMain(self: *Room) void {
-    fixedUpdateInterval(self) catch |e| {
+    fixedUpdateLoop(self) catch |e| {
         log.err("{}", .{e});
         if (@errorReturnTrace()) |trace| {
             std.debug.dumpStackTrace(trace);
@@ -23,10 +24,12 @@ pub fn fixedUpdateMain(self: *Room) void {
     };
 }
 
-pub fn fixedUpdateInterval(self: *Room) !void {
+pub fn fixedUpdateLoop(self: *Room) !void {
     const fixed_hz = 50;
     const tick_duration = @as(f64, 1.0) / @as(f64, fixed_hz);
     const sleep_heuristic = @max(@divFloor(1000, fixed_hz) - 4, 0);
+
+    self.delta_seconds = 0;
 
     switch (builtin.os.tag) {
         .windows => {
@@ -69,7 +72,7 @@ pub fn fixedUpdateInterval(self: *Room) !void {
             var current_time: std.posix.timespec = undefined;
 
             while (true) {
-                self.delta_seconds = 0;
+                defer self.delta_seconds = 0;
                 std.Thread.sleep(std.time.ns_per_ms * sleep_heuristic);
 
                 while (self.delta_seconds < tick_duration) {
